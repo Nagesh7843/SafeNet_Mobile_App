@@ -148,10 +148,12 @@ class MainActivity : ComponentActivity() {
 
     private fun toggleVpn() {
         if (SafeNetVpnService.isServiceActive) {
-            val intent = Intent(this, SafeNetVpnService::class.java).apply {
-                action = SafeNetVpnService.ACTION_STOP_VPN
-            }
-            startService(intent)
+            // Strict Lock Edition: Deactivation disabled
+            Toast.makeText(
+                this,
+                "SafeNet DNS protection is locked in permanent enforcement mode and cannot be turned off.",
+                Toast.LENGTH_LONG
+            ).show()
         } else {
             val prepareIntent = VpnService.prepare(this)
             if (prepareIntent != null) {

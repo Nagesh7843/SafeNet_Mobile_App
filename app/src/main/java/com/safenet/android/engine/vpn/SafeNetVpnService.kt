@@ -58,8 +58,8 @@ class SafeNetVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START_VPN
         if (action == ACTION_STOP_VPN) {
-            stopVpn(isRevocation = false)
-            return START_NOT_STICKY
+            android.util.Log.w("SafeNetVpnService", "ACTION_STOP_VPN ignored: SafeNet is running in permanent lockdown mode.")
+            return START_STICKY
         }
 
         ProtectionStateManager.instance.onVpnActivating()

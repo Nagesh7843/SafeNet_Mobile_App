@@ -131,25 +131,67 @@ fun DashboardScreen(
                         modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
                     )
 
-                    Button(
-                        onClick = onToggleVpn,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (details.isVpnInterfaceUp) CyberRed else CyberGreen,
-                            contentColor = Color.Black
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(
-                            imageVector = if (details.isVpnInterfaceUp) Icons.Default.Stop else Icons.Default.PlayArrow,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (details.isVpnInterfaceUp) "Deactivate Protection" else "Activate SafeNet Protection",
-                            fontWeight = FontWeight.Bold
-                        )
+                    if (details.isVpnInterfaceUp) {
+                        // Strict Lock Edition: Once DNS protection is active, deactivation is removed
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = CyberGreen.copy(alpha = 0.12f)
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.dp, CyberGreenGlow, RoundedCornerShape(12.dp)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 14.dp, horizontal = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Lock,
+                                    contentDescription = "Protection Locked Active",
+                                    tint = CyberGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        text = "Protection Locked & Active",
+                                        fontWeight = FontWeight.Bold,
+                                        color = CyberGreen,
+                                        fontSize = 14.sp
+                                    )
+                                    Text(
+                                        text = "Deactivation disabled • Permanent enforcement",
+                                        color = TextSecondary,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Button(
+                            onClick = onToggleVpn,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CyberGreen,
+                                contentColor = Color.Black
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Activate SafeNet Protection",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
             }

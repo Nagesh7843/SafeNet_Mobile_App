@@ -19,9 +19,10 @@ This master document provides an exhaustive, unified record of the architecture,
 |---|---|---|
 | **Version 1.0.0 APK (Baseline)** | `d:\safe_pc_app\releases\SafeNet_v1.0.0_baseline.apk` | **55.97 MB** (Hash verified, git tag `v1.0.0`) |
 | **Version 2.0.0 APK (Hardened)** | `d:\safe_pc_app\releases\SafeNet_v2.0.0_hardened.apk` | **55.87 MB** (Hash verified, git tag `v2.0.0`) |
+| **Version 2.1.0 APK (Strict Lock)** | `d:\safe_pc_app\releases\SafeNet_v2.1.0_strict_lock.apk` | **55.88 MB** (Hash verified, Permanent "No Turn-Off" Edition) |
 | **Git Commit 1 (v1.0.0)** | Commit hash: `2fe3e7f` | `Release v1.0.0: SafeNet Mobile App Baseline` |
 | **Git Commit 2 (v2.0.0)** | Commit hash: `e122bab` | `feat(v2.0.0): SafeNet Mobile App Hardened Protection, Launcher Independence and Recovery` |
-| **Automated Test Suite** | 32 Unit Tests in `app/src/test` | **100% Passed (32/32 tests successful in 3s)** |
+| **Automated Test Suite** | 32 Unit Tests in `app/src/test` | **100% Passed (32/32 tests successful in 18s)** |
 
 ---
 
@@ -778,5 +779,45 @@ CATEGORY 10: ARCHITECTURAL SPECIFICATIONS & REPOSITORY DOCUMENTATION
 #### 61. `SECURITY.md`, `PRIVACY.md`, `TESTING.md`, `IMPLEMENTATION_ROADMAP.md`, `MODULES.md`
 - **Role:** Privacy, zero-telemetry guarantees, test procedures, and module indexes.
 #### 62. `SAFE_NET_VERSIONS_MASTER_DOCUMENTATION.md`
-- **Role:** Master documentation consolidating all information, audit findings, comparisons, and file catalogs for v1.0.0 and v2.0.0.
+- **Role:** Master documentation consolidating all information, audit findings, comparisons, and file catalogs for v1.0.0, v2.0.0, and v2.1.0.
+
+---
+
+## 7. Version 2.1.0 (Strict Permanent Lockdown Edition — "No Turn-Off")
+
+### 7.1. Edition Objective & Requirements
+In specialized high-assurance environments, parental controls, or corporate kiosk enforcement, users require that **once Safe DNS protection is initiated, it cannot be reversed or turned off by the device user**. The deactivation control must be completely removed from the user interface, and the underlying service must refuse stop requests.
+
+### 7.2. Implementation Architecture
+
+#### 1. User Interface Deactivation Option Removal (`DashboardScreen.kt`)
+- **Baseline Behavior:** Rendered a toggle button that switched between "Activate SafeNet Protection" (green) and "Deactivate Protection" (red).
+- **Strict Lockdown Behavior:**
+  - Before start (`details.isVpnInterfaceUp == false`): Shows the green **"Activate SafeNet Protection"** button.
+  - After start (`details.isVpnInterfaceUp == true`): The deactivation button is **completely removed** from the layout.
+  - In its place, a non-interactive locked cyber card is rendered:
+    - **Visual Indicator:** `Icons.Default.Lock` in `CyberGreen`.
+    - **Title:** "Protection Locked & Active".
+    - **Subtitle:** "Deactivation disabled • Permanent enforcement".
+    - **Interactivity:** Non-clickable, preventing any user-initiated stop action from the UI.
+
+#### 2. Programmatic Invocation Rejection (`MainActivity.kt`)
+- In `MainActivity.toggleVpn()`:
+  - If `SafeNetVpnService.isServiceActive` is true, the method ignores the stop intent and immediately displays an informative warning Toast:
+    > *"SafeNet DNS protection is locked in permanent enforcement mode and cannot be turned off."*
+
+#### 3. Service-Level Enforcement (`SafeNetVpnService.kt`)
+- In `SafeNetVpnService.onStartCommand()`:
+  - Intercepts `ACTION_STOP_VPN` (`com.safenet.android.STOP_VPN`).
+  - Instead of invoking `stopVpn()`, the service logs a security warning:
+    `ACTION_STOP_VPN ignored: SafeNet is running in permanent lockdown mode.`
+  - Returns `START_STICKY`, keeping the virtual TUN interface and DNS filtering engine active and running.
+
+### 7.3. Release Details & Installation
+- **APK Filename:** `SafeNet_v2.1.0_strict_lock.apk`
+- **Output Directory:** `d:\safe_pc_app\releases\SafeNet_v2.1.0_strict_lock.apk`
+- **Binary Size:** 55.88 MB (55,885,258 bytes)
+- **Version Code:** `3`
+- **Version Name:** `2.1.0-strict`
+
 
