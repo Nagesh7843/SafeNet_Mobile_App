@@ -1,8 +1,7 @@
 package com.safenet.android.ui.dashboard
 
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,9 +23,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.safenet.android.SafeNetApplication
-import com.safenet.android.domain.model.OverallProtectionState
-import com.safenet.android.engine.vpn.SafeNetVpnService
+import com.safenet.android.core.launcher.LauncherManager
+import com.safenet.android.core.state.ProtectionState
+import com.safenet.android.core.state.ProtectionStateManager
+import com.safenet.android.core.vpn.AlwaysOnVpnHelper
 import com.safenet.android.ui.theme.*
+import java.text.SimpleDateFormat
+import java.util.*
 
 @Composable
 fun DashboardScreen(
@@ -36,41 +39,32 @@ fun DashboardScreen(
     val context = LocalContext.current
     val app = SafeNetApplication.instance
     val dpcManager = app.dpcManager
-    val browserManager = app.browserPolicyManager
 
-    // Read real system states
-    var isVpnActive by remember { mutableStateOf(SafeNetVpnService.isServiceActive) }
-    var isDeviceOwner by remember { mutableStateOf(dpcManager.isDeviceOwner()) }
-    var isLockdown by remember { mutableStateOf(dpcManager.isAlwaysOnLockdownEnabled()) }
-    var isChromeRestricted by remember { mutableStateOf(browserManager.isChromeIncognitoRestricted()) }
-    var totalBlocked by remember { mutableStateOf(SafeNetVpnService.filterEngine.totalQueriesBlocked.get()) }
-    var totalProcessed by remember { mutableStateOf(SafeNetVpnService.filterEngine.totalQueriesProcessed.get()) }
-    var ruleCount by remember { mutableStateOf(SafeNetVpnService.filterEngine.trie.ruleCount) }
+    // Collect reactive state directly from the centralized ProtectionStateManager
+    val details by ProtectionStateManager.instance.details.collectAsState()
 
-    // Periodic refresh
-    LaunchedEffect(Unit) {
-        while (true) {
-            isVpnActive = SafeNetVpnService.isServiceActive
-            isDeviceOwner = dpcManager.isDeviceOwner()
-            isLockdown = dpcManager.isAlwaysOnLockdownEnabled()
-            isChromeRestricted = browserManager.isChromeIncognitoRestricted()
-            totalBlocked = SafeNetVpnService.filterEngine.totalQueriesBlocked.get()
-            totalProcessed = SafeNetVpnService.filterEngine.totalQueriesProcessed.get()
-            ruleCount = SafeNetVpnService.filterEngine.trie.ruleCount
-            kotlinx.coroutines.delay(1000)
-        }
+    var isIconVisible by remember {
+        mutableStateOf(LauncherManager.isLauncherIconVisible(context))
     }
 
-    val overallState = when {
-        !isVpnActive -> OverallProtectionState.VPN_DISCONNECTED
-        !isDeviceOwner -> OverallProtectionState.PARTIALLY_PROTECTED
-        isVpnActive && isDeviceOwner && isLockdown -> OverallProtectionState.PROTECTED
-        else -> OverallProtectionState.PARTIALLY_PROTECTED
+    val stateColor = when (details.state) {
+        ProtectionState.ACTIVE -> CyberGreen
+        ProtectionState.DEGRADED -> CyberAmber
+        ProtectionState.NETWORK_UNAVAILABLE -> CyberAmber
+        ProtectionState.NOT_CONFIGURED, ProtectionState.VPN_PERMISSION_REQUIRED -> CyberBlue
+        ProtectionState.ACTIVATING -> CyberBlue
+        ProtectionState.VPN_DISABLED, ProtectionState.RECOVERY_REQUIRED -> CyberRed
     }
 
-    val networkType = remember(isVpnActive) {
-        getNetworkType(context)
+    val stateGlow = when (details.state) {
+        ProtectionState.ACTIVE -> CyberGreenGlow
+        ProtectionState.DEGRADED, ProtectionState.NETWORK_UNAVAILABLE -> CyberAmberGlow
+        ProtectionState.NOT_CONFIGURED, ProtectionState.VPN_PERMISSION_REQUIRED -> CyberBlueGlow
+        ProtectionState.ACTIVATING -> CyberBlueGlow
+        ProtectionState.VPN_DISABLED, ProtectionState.RECOVERY_REQUIRED -> CyberRedGlow
     }
+
+    val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
     LazyColumn(
         modifier = modifier
@@ -97,15 +91,18 @@ fun DashboardScreen(
                         modifier = Modifier
                             .size(72.dp)
                             .clip(CircleShape)
-                            .background(
-                                if (isVpnActive) CyberGreenGlow else CyberRedGlow
-                            ),
+                            .background(stateGlow),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = if (isVpnActive) Icons.Default.Shield else Icons.Default.ShieldMoon,
+                            imageVector = when (details.state) {
+                                ProtectionState.ACTIVE -> Icons.Default.Shield
+                                ProtectionState.DEGRADED -> Icons.Default.Warning
+                                ProtectionState.NETWORK_UNAVAILABLE -> Icons.Default.SignalCellularConnectedNoInternet0Bar
+                                else -> Icons.Default.ShieldMoon
+                            },
                             contentDescription = "Shield Status",
-                            tint = if (isVpnActive) CyberGreen else CyberRed,
+                            tint = stateColor,
                             modifier = Modifier.size(40.dp)
                         )
                     }
@@ -113,18 +110,22 @@ fun DashboardScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Text(
-                        text = overallState.displayName,
+                        text = details.state.displayName,
                         fontSize = 22.sp,
                         fontWeight = FontWeight.Bold,
-                        color = when (overallState) {
-                            OverallProtectionState.PROTECTED -> CyberGreen
-                            OverallProtectionState.PARTIALLY_PROTECTED -> CyberAmber
-                            else -> CyberRed
-                        }
+                        color = stateColor
                     )
 
                     Text(
-                        text = if (isVpnActive) "Always-on network tunnel and DNS inspection active" else "Network traffic is currently unfiltered",
+                        text = when (details.state) {
+                            ProtectionState.ACTIVE -> "Local TUN interface active with sub-millisecond DNS inspection"
+                            ProtectionState.DEGRADED -> "Protection degraded: ${details.missingRequirementMessage ?: "Inspection warnings detected"}"
+                            ProtectionState.NETWORK_UNAVAILABLE -> "Waiting for physical Wi-Fi or cellular network interface"
+                            ProtectionState.VPN_DISABLED -> "Network traffic is currently unfiltered"
+                            ProtectionState.RECOVERY_REQUIRED -> "Protection stopped: manual authorization or restart needed"
+                            ProtectionState.ACTIVATING -> "Establishing secure local TUN interface..."
+                            else -> "Configuration or VPN permissions required"
+                        },
                         fontSize = 13.sp,
                         color = TextSecondary,
                         modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
@@ -133,22 +134,62 @@ fun DashboardScreen(
                     Button(
                         onClick = onToggleVpn,
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isVpnActive) CyberRed else CyberGreen,
+                            containerColor = if (details.isVpnInterfaceUp) CyberRed else CyberGreen,
                             contentColor = Color.Black
                         ),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Icon(
-                            imageVector = if (isVpnActive) Icons.Default.Stop else Icons.Default.PlayArrow,
+                            imageVector = if (details.isVpnInterfaceUp) Icons.Default.Stop else Icons.Default.PlayArrow,
                             contentDescription = null,
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isVpnActive) "Deactivate Protection" else "Activate SafeNet Protection",
+                            text = if (details.isVpnInterfaceUp) "Deactivate Protection" else "Activate SafeNet Protection",
                             fontWeight = FontWeight.Bold
                         )
+                    }
+                }
+            }
+        }
+
+        // Interruption / Degradation Warning Alert (if applicable)
+        if (details.lastInterruptionReason != null && details.state != ProtectionState.ACTIVE) {
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, CyberAmberGlow, RoundedCornerShape(12.dp)),
+                    colors = CardDefaults.cardColors(containerColor = CyberCard)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = null,
+                            tint = CyberAmber,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Last Interruption", color = CyberAmber, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(
+                                text = details.lastInterruptionReason ?: "Unknown cause",
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            if (details.lastInterruptionTimestamp > 0) {
+                                Text(
+                                    text = "Interrupted at ${timeFormatter.format(Date(details.lastInterruptionTimestamp))}",
+                                    color = TextMuted,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -162,14 +203,14 @@ fun DashboardScreen(
             ) {
                 MetricCard(
                     title = "Blocked Requests",
-                    value = totalBlocked.toString(),
+                    value = details.totalQueriesBlocked.toString(),
                     icon = Icons.Default.Block,
                     accentColor = CyberRed,
                     modifier = Modifier.weight(1f)
                 )
                 MetricCard(
                     title = "Rules in Trie",
-                    value = ruleCount.toString(),
+                    value = details.ruleCount.toString(),
                     icon = Icons.Default.ListAlt,
                     accentColor = CyberBlue,
                     modifier = Modifier.weight(1f)
@@ -197,43 +238,90 @@ fun DashboardScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     HealthStatusRow(
-                        title = "VPN Protection Engine",
-                        subtitle = if (isVpnActive) "TUN interface 10.254.1.2 bound" else "TUN interface offline",
-                        isActive = isVpnActive,
+                        title = "VPN Protection Tunnel",
+                        subtitle = if (details.isVpnInterfaceUp) "TUN bound (10.254.1.2 / fd00::2)" else "Tunnel offline",
+                        isActive = details.isVpnInterfaceUp,
                         icon = Icons.Default.VpnKey
                     )
                     Divider(color = CyberCardBorder, modifier = Modifier.padding(vertical = 10.dp))
 
                     HealthStatusRow(
                         title = "DNS Filtering Engine",
-                        subtitle = if (ruleCount > 0) "Zero-latency trie matching active" else "No rules loaded",
-                        isActive = ruleCount > 0 && isVpnActive,
+                        subtitle = if (details.isDnsEngineOperational) "Zero-latency radix trie active" else "Inspection inactive",
+                        isActive = details.isDnsEngineOperational,
                         icon = Icons.Default.Dns
                     )
                     Divider(color = CyberCardBorder, modifier = Modifier.padding(vertical = 10.dp))
 
                     HealthStatusRow(
-                        title = "Android Device Owner (DPC)",
-                        subtitle = if (isDeviceOwner) "DevicePolicyManager fully managed" else "Provisioning required via ADB/QR",
-                        isActive = isDeviceOwner,
-                        icon = Icons.Default.AdminPanelSettings
+                        title = "Upstream Security DNS",
+                        subtitle = "Target: ${details.activeUpstreamResolver}",
+                        isActive = details.isNetworkConnected && details.isVpnInterfaceUp,
+                        icon = Icons.Default.Language
                     )
                     Divider(color = CyberCardBorder, modifier = Modifier.padding(vertical = 10.dp))
 
                     HealthStatusRow(
-                        title = "OS-Level VPN Lockdown",
-                        subtitle = if (isLockdown) "Fail-closed kernel policy engaged" else "Unrestricted fallback enabled",
-                        isActive = isLockdown,
-                        icon = Icons.Default.Lock
+                        title = "Launcher Icon Independence",
+                        subtitle = if (isIconVisible) "Launcher icon visible in drawer" else "Launcher icon hidden (Protection unaffected)",
+                        isActive = true,
+                        icon = if (isIconVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff
                     )
-                    Divider(color = CyberCardBorder, modifier = Modifier.padding(vertical = 10.dp))
+                }
+            }
+        }
 
-                    HealthStatusRow(
-                        title = "Chrome Incognito Restriction",
-                        subtitle = if (isChromeRestricted) "IncognitoModeAvailability = 1" else "Chrome unmanaged or permitted",
-                        isActive = isChromeRestricted,
-                        icon = Icons.Default.VisibilityOff
-                    )
+        // Launcher Icon Quick Action
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, CyberCardBorder, RoundedCornerShape(14.dp)),
+                colors = CardDefaults.cardColors(containerColor = CyberSurface),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (isIconVisible) "Hide App Launcher Icon" else "Restore Launcher Icon",
+                            color = TextPrimary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = if (isIconVisible) "Hiding removes the icon from drawer while DNS filtering continues without interruption." else "Restores the icon back to your app drawer.",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Button(
+                        onClick = {
+                            val newVisibility = !isIconVisible
+                            val success = LauncherManager.setLauncherIconVisible(context, newVisibility)
+                            if (success) {
+                                isIconVisible = newVisibility
+                                Toast.makeText(
+                                    context,
+                                    if (newVisibility) "Launcher icon restored" else "Launcher icon hidden. Protection continues! Reopen via notification or safenet://open",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isIconVisible) CyberAmber else CyberGreen,
+                            contentColor = Color.Black
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(if (isIconVisible) "Hide Icon" else "Show Icon", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }
@@ -255,12 +343,12 @@ fun DashboardScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column {
-                        Text("Active Interface", color = TextSecondary, fontSize = 12.sp)
-                        Text(networkType, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text("Active Physical Interface", color = TextSecondary, fontSize = 12.sp)
+                        Text(details.networkInterfaceType, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     }
                     Column(horizontalAlignment = Alignment.End) {
-                        Text("Total Queries", color = TextSecondary, fontSize = 12.sp)
-                        Text(totalProcessed.toString(), color = CyberGreen, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text("Total Queries Processed", color = TextSecondary, fontSize = 12.sp)
+                        Text(details.totalQueriesProcessed.toString(), color = CyberGreen, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     }
                 }
             }
@@ -335,18 +423,5 @@ private fun HealthStatusRow(
                 .clip(CircleShape)
                 .background(if (isActive) CyberGreen else CyberRed)
         )
-    }
-}
-
-private fun getNetworkType(context: Context): String {
-    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-    val activeNet = cm.activeNetwork ?: return "Disconnected"
-    val caps = cm.getNetworkCapabilities(activeNet) ?: return "Unknown"
-    return when {
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi Network"
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Cellular LTE/5G"
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN Active"
-        else -> "Connected"
     }
 }

@@ -14,6 +14,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.safenet.android.R
+import com.safenet.android.core.state.ProtectionStateManager
 import com.safenet.android.domain.model.FilterAction
 import com.safenet.android.engine.dns.DnsFilterEngine
 import com.safenet.android.engine.dns.DnsPacket
@@ -21,7 +22,6 @@ import com.safenet.android.engine.dns.DnsResolver
 import com.safenet.android.ui.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class SafeNetVpnService : VpnService() {
@@ -58,13 +58,20 @@ class SafeNetVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START_VPN
         if (action == ACTION_STOP_VPN) {
-            stopVpn()
+            stopVpn(isRevocation = false)
             return START_NOT_STICKY
         }
 
+        ProtectionStateManager.instance.onVpnActivating()
         startForeground(NOTIFICATION_ID, buildForegroundNotification())
         startVpn()
         return START_STICKY
+    }
+
+    override fun onRevoke() {
+        ProtectionStateManager.instance.onVpnRevoked()
+        stopVpn(isRevocation = true)
+        super.onRevoke()
     }
 
     private fun startVpn() {
@@ -84,23 +91,40 @@ class SafeNetVpnService : VpnService() {
                 .addDnsServer("fd00::1")
                 .setBlocking(true)
 
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
-                stopSelf()
+            val pfd = builder.establish()
+            if (pfd == null || !pfd.fileDescriptor.valid()) {
+                ProtectionStateManager.instance.recordInterruption(
+                    "Failed to establish VPN interface: ParcelFileDescriptor is null or invalid.",
+                    requiresRecovery = true
+                )
+                stopVpn(isRevocation = false)
                 return
             }
 
+            vpnInterface = pfd
             isRunning.set(true)
             isServiceActive = true
 
+            // Register dynamic network monitor
             registerNetworkMonitor()
 
+            // Update centralized state to ACTIVE only after interface is established
+            ProtectionStateManager.instance.onVpnOperational(
+                upstreamResolver = dnsResolver?.currentProvider?.primaryIpv4 ?: "1.1.1.3",
+                ruleCount = filterEngine.trie.ruleCount
+            )
+
+            // Start dedicated packet processing thread
             workerThread = Thread({ runPacketLoop() }, "SafeNet-PacketProcessor").apply {
                 priority = Thread.MAX_PRIORITY
                 start()
             }
         } catch (e: Exception) {
-            stopVpn()
+            ProtectionStateManager.instance.recordInterruption(
+                "Exception during VPN establishment: ${e.localizedMessage}",
+                requiresRecovery = true
+            )
+            stopVpn(isRevocation = false)
         }
     }
 
@@ -109,6 +133,7 @@ class SafeNetVpnService : VpnService() {
         val inputStream = FileInputStream(pfd.fileDescriptor)
         val outputStream = FileOutputStream(pfd.fileDescriptor)
         val packetBuffer = ByteArray(32767)
+        var iteration = 0L
 
         while (isRunning.get()) {
             try {
@@ -116,6 +141,15 @@ class SafeNetVpnService : VpnService() {
                 if (length <= 0) continue
 
                 processPacket(packetBuffer, length, outputStream)
+
+                // Periodically sync live query metrics to ProtectionStateManager
+                if (++iteration % 50 == 0L) {
+                    ProtectionStateManager.instance.updateMetrics(
+                        totalProcessed = filterEngine.totalQueriesProcessed.get(),
+                        totalBlocked = filterEngine.totalQueriesBlocked.get(),
+                        ruleCount = filterEngine.trie.ruleCount
+                    )
+                }
             } catch (e: Exception) {
                 if (!isRunning.get()) break
             }
@@ -123,18 +157,24 @@ class SafeNetVpnService : VpnService() {
     }
 
     private fun processPacket(buffer: ByteArray, length: Int, outputStream: FileOutputStream) {
-        if (length < 20) return // Minimum IPv4 header length
+        if (length < 20) return
 
         val version = (buffer[0].toInt() shr 4) and 0x0F
-        if (version != 4) return // Currently focus on IPv4 packet routing
 
+        if (version == 4) {
+            processIpv4Packet(buffer, length, outputStream)
+        } else if (version == 6) {
+            processIpv6Packet(buffer, length, outputStream)
+        }
+    }
+
+    private fun processIpv4Packet(buffer: ByteArray, length: Int, outputStream: FileOutputStream) {
         val ihl = (buffer[0].toInt() and 0x0F) * 4
         if (length < ihl + 8) return
 
         val protocol = buffer[9].toInt() and 0xFF
-        if (protocol != 17) return // Only UDP packets for DNS
+        if (protocol != 17) return // Only UDP DNS
 
-        // Extract UDP Ports
         val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
         val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
         val udpLen = ((buffer[ihl + 4].toInt() and 0xFF) shl 8) or (buffer[ihl + 5].toInt() and 0xFF)
@@ -145,29 +185,19 @@ class SafeNetVpnService : VpnService() {
         val dnsLength = udpLen - 8
         if (dnsLength <= 0 || dnsOffset + dnsLength > length) return
 
-        // Parse DNS query
         val dnsPacket = DnsPacket.parse(buffer, dnsOffset, dnsLength) ?: return
-        if (dnsPacket.isResponse) return // We process incoming queries, not responses
+        if (dnsPacket.isResponse) return
 
-        // Evaluate domain through filtering engine
-        val evaluation = filterEngine.evaluate(dnsPacket.qName)
+        val evaluation = filterEngine.evaluate(dnsPacket.qName, isIpv6 = false)
 
         val dnsResponseBytes: ByteArray? = when (evaluation.action) {
-            FilterAction.BLOCK_SINKHOLE -> {
-                // Return 0.0.0.0 sinkhole
-                DnsPacket.buildSyntheticResponse(dnsPacket, "0.0.0.0")
-            }
-            FilterAction.BLOCK_NXDOMAIN -> {
-                // Return NXDOMAIN
-                DnsPacket.buildNxDomainResponse(dnsPacket)
-            }
+            FilterAction.BLOCK_SINKHOLE -> DnsPacket.buildSinkholeResponse(dnsPacket)
+            FilterAction.BLOCK_NXDOMAIN -> DnsPacket.buildNxDomainResponse(dnsPacket)
             FilterAction.REWRITE_SAFESEARCH -> {
-                // Return strict SafeSearch VIP IP
                 val rewriteIp = evaluation.rewrittenIp ?: "216.239.38.120"
                 DnsPacket.buildSyntheticResponse(dnsPacket, rewriteIp)
             }
             FilterAction.ALLOW -> {
-                // Query trusted upstream resolver via protected socket
                 val resolver = dnsResolver
                 if (resolver != null) {
                     val queryBytes = ByteArray(dnsLength)
@@ -178,11 +208,55 @@ class SafeNetVpnService : VpnService() {
         }
 
         if (dnsResponseBytes != null) {
-            writeUdpResponse(buffer, ihl, srcPort, dstPort, dnsResponseBytes, outputStream)
+            writeIpv4UdpResponse(buffer, ihl, srcPort, dstPort, dnsResponseBytes, outputStream)
         }
     }
 
-    private fun writeUdpResponse(
+    private fun processIpv6Packet(buffer: ByteArray, length: Int, outputStream: FileOutputStream) {
+        if (length < 48) return // 40-byte IPv6 header + 8-byte UDP header
+
+        val nextHeader = buffer[6].toInt() and 0xFF
+        if (nextHeader != 17) return // Only UDP
+
+        val ihl = 40
+        val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
+        val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
+        val udpLen = ((buffer[ihl + 4].toInt() and 0xFF) shl 8) or (buffer[ihl + 5].toInt() and 0xFF)
+
+        if (dstPort != 53) return
+
+        val dnsOffset = ihl + 8
+        val dnsLength = udpLen - 8
+        if (dnsLength <= 0 || dnsOffset + dnsLength > length) return
+
+        val dnsPacket = DnsPacket.parse(buffer, dnsOffset, dnsLength) ?: return
+        if (dnsPacket.isResponse) return
+
+        val evaluation = filterEngine.evaluate(dnsPacket.qName, isIpv6 = true)
+
+        val dnsResponseBytes: ByteArray? = when (evaluation.action) {
+            FilterAction.BLOCK_SINKHOLE -> DnsPacket.buildSinkholeResponse(dnsPacket)
+            FilterAction.BLOCK_NXDOMAIN -> DnsPacket.buildNxDomainResponse(dnsPacket)
+            FilterAction.REWRITE_SAFESEARCH -> {
+                val rewriteIp = evaluation.rewrittenIp ?: "2001:4860:4806::78"
+                DnsPacket.buildSyntheticResponse(dnsPacket, rewriteIp)
+            }
+            FilterAction.ALLOW -> {
+                val resolver = dnsResolver
+                if (resolver != null) {
+                    val queryBytes = ByteArray(dnsLength)
+                    System.arraycopy(buffer, dnsOffset, queryBytes, 0, dnsLength)
+                    resolver.forwardQuery(queryBytes)
+                } else null
+            }
+        }
+
+        if (dnsResponseBytes != null) {
+            writeIpv6UdpResponse(buffer, srcPort, dstPort, dnsResponseBytes, outputStream)
+        }
+    }
+
+    private fun writeIpv4UdpResponse(
         reqPacket: ByteArray,
         ihl: Int,
         clientPort: Int,
@@ -194,43 +268,79 @@ class SafeNetVpnService : VpnService() {
         val respTotalLen = ihl + respUdpLen
         val response = ByteArray(respTotalLen)
 
-        // Copy original IP Header
+        // Copy IP Header
         System.arraycopy(reqPacket, 0, response, 0, ihl)
 
-        // Update Total Length in IP Header
+        // Total Length
         response[2] = ((respTotalLen shr 8) and 0xFF).toByte()
         response[3] = (respTotalLen and 0xFF).toByte()
 
         // Swap Source & Destination IPs
-        // Client IP: bytes 12..15, Server IP: bytes 16..19
-        System.arraycopy(reqPacket, 16, response, 12, 4) // Source IP = original Dest IP
-        System.arraycopy(reqPacket, 12, response, 16, 4) // Dest IP = original Source IP
+        System.arraycopy(reqPacket, 16, response, 12, 4)
+        System.arraycopy(reqPacket, 12, response, 16, 4)
 
-        // Recalculate IPv4 Header Checksum
+        // Checksum
         response[10] = 0
         response[11] = 0
         val ipChecksum = computeIpChecksum(response, 0, ihl)
         response[10] = ((ipChecksum shr 8) and 0xFF).toByte()
         response[11] = (ipChecksum and 0xFF).toByte()
 
-        // Build UDP Header
-        // Source Port = original Dest Port (53)
+        // UDP Header
         response[ihl] = ((serverPort shr 8) and 0xFF).toByte()
         response[ihl + 1] = (serverPort and 0xFF).toByte()
-        // Destination Port = original Client Port
         response[ihl + 2] = ((clientPort shr 8) and 0xFF).toByte()
         response[ihl + 3] = (clientPort and 0xFF).toByte()
-        // UDP Length
         response[ihl + 4] = ((respUdpLen shr 8) and 0xFF).toByte()
         response[ihl + 5] = (respUdpLen and 0xFF).toByte()
-        // UDP Checksum = 0 (UDP checksum is optional in IPv4)
         response[ihl + 6] = 0
         response[ihl + 7] = 0
 
-        // Copy DNS Payload
+        // DNS Payload
         System.arraycopy(dnsPayload, 0, response, ihl + 8, dnsPayload.size)
 
-        // Write directly back to TUN virtual interface
+        synchronized(outputStream) {
+            outputStream.write(response)
+            outputStream.flush()
+        }
+    }
+
+    private fun writeIpv6UdpResponse(
+        reqPacket: ByteArray,
+        clientPort: Int,
+        serverPort: Int,
+        dnsPayload: ByteArray,
+        outputStream: FileOutputStream
+    ) {
+        val ihl = 40
+        val respUdpLen = 8 + dnsPayload.size
+        val respTotalLen = ihl + respUdpLen
+        val response = ByteArray(respTotalLen)
+
+        // Copy IPv6 Header
+        System.arraycopy(reqPacket, 0, response, 0, ihl)
+
+        // Payload Length in IPv6 header (bytes 4..5)
+        response[4] = ((respUdpLen shr 8) and 0xFF).toByte()
+        response[5] = (respUdpLen and 0xFF).toByte()
+
+        // Swap Source & Destination IPv6 addresses (bytes 8..23 with 24..39)
+        System.arraycopy(reqPacket, 24, response, 8, 16)
+        System.arraycopy(reqPacket, 8, response, 24, 16)
+
+        // UDP Header
+        response[ihl] = ((serverPort shr 8) and 0xFF).toByte()
+        response[ihl + 1] = (serverPort and 0xFF).toByte()
+        response[ihl + 2] = ((clientPort shr 8) and 0xFF).toByte()
+        response[ihl + 3] = (clientPort and 0xFF).toByte()
+        response[ihl + 4] = ((respUdpLen shr 8) and 0xFF).toByte()
+        response[ihl + 5] = (respUdpLen and 0xFF).toByte()
+        response[ihl + 6] = 0
+        response[ihl + 7] = 0
+
+        // DNS Payload
+        System.arraycopy(dnsPayload, 0, response, ihl + 8, dnsPayload.size)
+
         synchronized(outputStream) {
             outputStream.write(response)
             outputStream.flush()
@@ -261,20 +371,25 @@ class SafeNetVpnService : VpnService() {
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                // Update underlying networks so VPN transparently re-routes over new physical interface
                 setUnderlyingNetworks(arrayOf(network))
+                ProtectionStateManager.instance.onNetworkConnectivityChanged(true, "Physical Network Connected")
             }
 
             override fun onLost(network: Network) {
                 setUnderlyingNetworks(null)
+                ProtectionStateManager.instance.onNetworkConnectivityChanged(false, "Network Lost")
             }
         }
         networkCallback?.let { connectivityManager.registerNetworkCallback(request, it) }
     }
 
-    private fun stopVpn() {
+    private fun stopVpn(isRevocation: Boolean = false) {
         isRunning.set(false)
         isServiceActive = false
+
+        if (!isRevocation) {
+            ProtectionStateManager.instance.onVpnStopped()
+        }
 
         try {
             networkCallback?.let { connectivityManager.unregisterNetworkCallback(it) }
@@ -286,12 +401,17 @@ class SafeNetVpnService : VpnService() {
         } catch (e: Exception) {}
         vpnInterface = null
 
+        try {
+            workerThread?.interrupt()
+        } catch (e: Exception) {}
+        workerThread = null
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        stopVpn()
+        stopVpn(isRevocation = false)
         super.onDestroy()
     }
 
@@ -311,7 +431,9 @@ class SafeNetVpnService : VpnService() {
     }
 
     private fun buildForegroundNotification(): Notification {
-        val launchIntent = Intent(this, MainActivity::class.java)
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
         val pendingIntent = PendingIntent.getActivity(
             this, 0, launchIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT

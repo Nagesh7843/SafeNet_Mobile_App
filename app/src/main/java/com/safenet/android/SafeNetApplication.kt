@@ -1,7 +1,9 @@
 package com.safenet.android
 
 import android.app.Application
+import com.safenet.android.core.monitor.TamperMonitor
 import com.safenet.android.core.security.SecurityKeyStoreHelper
+import com.safenet.android.core.state.ProtectionStateManager
 import com.safenet.android.data.db.SafeNetDatabaseHelper
 import com.safenet.android.dpc.DpcManager
 import com.safenet.android.dpc.browser.BrowserPolicyManager
@@ -24,6 +26,12 @@ class SafeNetApplication : Application() {
 
     lateinit var keyStoreHelper: SecurityKeyStoreHelper
         private set
+
+    lateinit var tamperMonitor: TamperMonitor
+        private set
+
+    val stateManager: ProtectionStateManager
+        get() = ProtectionStateManager.instance
 
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -49,5 +57,9 @@ class SafeNetApplication : Application() {
                 } catch (e: Exception) {}
             }
         }
+
+        // Initialize and start ongoing tamper and health monitoring
+        tamperMonitor = TamperMonitor(this, stateManager)
+        tamperMonitor.startMonitoring(applicationScope)
     }
 }

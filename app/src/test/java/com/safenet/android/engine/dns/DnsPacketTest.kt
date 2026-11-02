@@ -86,6 +86,31 @@ class DnsPacketTest {
     }
 
     @Test
+    fun testBuildIpv6SinkholeResponse() {
+        val queryBytes = createSampleDnsQuery("malicious-v6.com", 0x9999.toShort())
+        val queryPacket = DnsPacket.parse(queryBytes)!!
+
+        val responseBytes = DnsPacket.buildSyntheticResponse(queryPacket, "::")
+        assertNotNull(responseBytes)
+
+        val buffer = ByteBuffer.wrap(responseBytes)
+        val respId = buffer.short.toInt() and 0xFFFF
+        assertEquals(0x9999, respId)
+        // Check answer length for IPv6 AAAA record (28 bytes answer)
+        assertTrue(responseBytes.size > queryBytes.size)
+    }
+
+    @Test
+    fun testBuildSinkholeHelper() {
+        val queryBytes = createSampleDnsQuery("adult-test.com", 0x5555.toShort())
+        val queryPacket = DnsPacket.parse(queryBytes)!!
+
+        val sinkholeBytes = DnsPacket.buildSinkholeResponse(queryPacket)
+        assertNotNull(sinkholeBytes)
+        assertTrue(sinkholeBytes.isNotEmpty())
+    }
+
+    @Test
     fun testMalformedPacketSafety() {
         val truncatedHeader = ByteArray(8)
         assertNull(DnsPacket.parse(truncatedHeader))

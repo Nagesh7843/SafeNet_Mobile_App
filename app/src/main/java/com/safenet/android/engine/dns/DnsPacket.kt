@@ -99,6 +99,14 @@ class DnsPacket(
         }
 
         /**
+         * Synthesizes an authoritative RFC 1035 sinkhole response (0.0.0.0 for A, :: for AAAA).
+         */
+        fun buildSinkholeResponse(query: DnsPacket, ttlSeconds: Int = 300): ByteArray {
+            val sinkholeIp = if (query.qType == TYPE_AAAA) "::" else "0.0.0.0"
+            return buildSyntheticResponse(query, sinkholeIp, ttlSeconds)
+        }
+
+        /**
          * Synthesizes an authoritative RFC 1035 DNS response with a sinkhole or rewritten IP.
          */
         fun buildSyntheticResponse(
